@@ -1,0 +1,9 @@
+vicuna/
+qemu.log
+qemu_vec.log
+*.swp
+.claude/
+vector_fw/build_qemu/*
+vector_fw/build_rtl/*
+!vector_fw/build_qemu/.gitkeep
+!vector_fw/build_rtl/.gitkeep
