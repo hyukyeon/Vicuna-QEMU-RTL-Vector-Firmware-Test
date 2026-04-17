@@ -8,7 +8,8 @@
 
 에서 각각 실행해 결과를 확인할 수 있게 해준다.
 
-이 저장소에는 Vicuna 원본을 포함하지 않는다. 대신, 로컬에 `vicuna/` 디렉터리로 upstream Vicuna를 clone해 두는 구성을 전제로 한다.
+이 저장소는 `vicuna/`를 **git submodule**로 사용한다.  
+따라서 clone할 때 submodule까지 함께 받아야 정상 동작한다.
 
 
 ## 디렉터리 구성
@@ -62,20 +63,14 @@ cd ~/vicuna-fw-test
 ### 3. 이 저장소 clone
 
 ```sh
-git clone https://github.com/hyukyeon/Vicuna-QEMU-RTL-Vector-Firmware-Test.git
+git clone --recursive https://github.com/hyukyeon/Vicuna-QEMU-RTL-Vector-Firmware-Test.git
 cd Vicuna-QEMU-RTL-Vector-Firmware-Test
 ```
 
-
-### 4. Vicuna 원본 및 submodule clone
-
-이 프로젝트의 wrapper는 루트 기준 `./vicuna` 경로를 기대한다.
+이미 clone한 저장소라면 다음 명령으로 submodule까지 받아온다.
 
 ```sh
-git clone https://github.com/vproc/vicuna.git vicuna
-cd vicuna
 git submodule update --init --recursive
-cd ..
 ```
 
 
