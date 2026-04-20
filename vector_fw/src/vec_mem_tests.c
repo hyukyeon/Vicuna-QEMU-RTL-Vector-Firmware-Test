@@ -7,7 +7,7 @@
 static int32_t a32[LEN] = {1, -2, 3, -4, 0x7fffffff, -1, 42, -100};
 static int32_t b32[LEN] = {0, 0, 0, 0, 0, 0, 0, 0};
 
-int32_t c[4] = {0};
+int32_t c[7] = {0};
 
 #if defined(VEC_COMPARE_QEMU)
 static inline void qemu_putc(char ch)
@@ -90,7 +90,50 @@ static void do_ops(void)
         /* read back first element into tmp and then into c[3] */
         c[3] = (int32_t)mem16[0];
     }
+
+    /* Test 4: unaligned load/store (base+1 offset) */
+    {
+        uint8_t buf[LEN * 4 + 1];
+        /* write little-endian int32 values into buf at offset 1 */
+        for (size_t i = 0; i < LEN; ++i) {
+            uint32_t v = (uint32_t)a32[i];
+            size_t off = 1 + i * 4;
+            buf[off + 0] = (uint8_t)(v & 0xff);
+            buf[off + 1] = (uint8_t)((v >> 8) & 0xff);
+            buf[off + 2] = (uint8_t)((v >> 16) & 0xff);
+            buf[off + 3] = (uint8_t)((v >> 24) & 0xff);
+        }
+        /* cast to int32_t* at unaligned address */
+        int32_t *p = (int32_t*)(buf + 1);
+        vl = __riscv_vsetvl_e32m1(n);
+        vint32m1_t vun = __riscv_vle32_v_i32m1(p, vl);
+        __riscv_vse32_v_i32m1((int32_t*)tmp, vun, vl);
+        c[4] = tmp[0];
+    }
+
+    /* Test 5: 2-segment interleaved load/store (emulated) */
+    {
+        int32_t memseg[LEN * 2];
+        for (size_t i = 0; i < LEN; ++i) {
+            memseg[2*i + 0] = a32[i];
+            memseg[2*i + 1] = b32[i];
+        }
+        int32_t seg0[LEN];
+        int32_t seg1[LEN];
+        for (size_t i = 0; i < LEN; ++i) {
+            seg0[i] = memseg[2*i + 0];
+            seg1[i] = memseg[2*i + 1];
+        }
+        vl = __riscv_vsetvl_e32m1(n);
+        vint32m1_t v0 = __riscv_vle32_v_i32m1(seg0, vl);
+        vint32m1_t v1 = __riscv_vle32_v_i32m1(seg1, vl);
+        __riscv_vse32_v_i32m1((int32_t*)tmp, v0, vl);
+        c[5] = tmp[0];
+        __riscv_vse32_v_i32m1((int32_t*)tmp, v1, vl);
+        c[6] = tmp[0];
+    }
 }
+
 
 int main(void)
 {
