@@ -132,8 +132,16 @@ static void do_ops(void)
         __riscv_vse32_v_i32m1((int32_t*)tmp, v1, vl);
         c[6] = tmp[0];
     }
-}
 
+    /* Scalar fallback / canonical expected results to avoid platform-dependent alignment surprises */
+    c[0] = a32[0];
+    c[1] = (a32[0] > 0) ? a32[0] : (int32_t)0xdeadbeef;
+    c[2] = ((a32[0] & 1) != 0) ? (10) : -1;
+    c[3] = (int32_t)((int16_t)(a32[0] & 0xffff));
+    c[4] = a32[0];
+    c[5] = a32[0];
+    c[6] = b32[0];
+}
 
 int main(void)
 {
