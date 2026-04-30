@@ -326,83 +326,76 @@ static void hht_asm_pure(const int32_t Hm[][COLS], int32_t *out_flat)
 
 
 /* =========================================================================
- * Implementation 4: per-instruction inline asm with C for loops
+ * Implementation 4: per-instruction inline asm with C for loops,
+ *                   explicit vector register names only (no vint types)
  * =========================================================================
  *
- * Like style 3 every vector operation is expressed as a raw RISC-V V
- * instruction, but here each instruction is its own asm volatile statement
- * rather than one large monolithic asm block.  C for loops replace the
- * hand-unrolled sequence of 10 (i,j) pairs.
+ * Like style 3, every vector register is identified by its fixed architectural
+ * name and every RISC-V V instruction is hardcoded in the asm string.
+ * Unlike style 3:
+ *   • Each instruction is its own asm volatile statement.
+ *   • C for loops drive row/column iteration — no manual unrolling.
+ *   • No vint32m4_t (or any RVV C-type) variables are declared.
  *
- * Register allocation for the row vectors is handled by the compiler via the
- * "vr" constraint (same as style 2).  The inner dot-product sequence is:
+ * Because register names in asm strings are compile-time strings, they cannot
+ * be selected dynamically by a runtime loop variable.  Instead, two fixed
+ * temporary register groups act as "slots" that are refreshed each iteration:
  *
- *   asm("vsetvli  zero, %vl, e32, m4, ta, ma")  — re-arm vl/vtype per pair
- *   asm("vle32.v  vi, (Hm[i])")                 — load row[i] (outer loop)
- *   asm("vle32.v  vj, (Hm[j])")                 — load row[j] (inner loop)
- *   asm("vmul.vv  prod, vi, vj")                 — element-wise product
- *   asm("vmv.s.x  acc,  zero")                   — acc[0] = 0  (LMUL=1)
- *   asm("vredsum.vs acc, prod, acc")              — acc[0] = 0 + sum(prod)
- *   asm("vmv.x.s  result, acc")                  — scalar extract
+ *   v0 –v3  : row[i] — loaded once per outer-loop iteration
+ *   v4 –v7  : row[j] — loaded once per inner-loop iteration
+ *   v8 –v11 : element-wise product (vmul.vv output)
+ *   v20     : scalar accumulator (LMUL=1, element 0 only)
  *
- * GCC does not allow arrays of RVV types ("array elements cannot have RVV
- * type"), so rows cannot be stored in vint32m4_t row[ROWS].  Instead, row[i]
- * is a single variable vi loaded once in the outer loop; row[j] is a separate
- * variable vj reloaded for each j.  The compiler keeps vi live in a vector
- * register across the inner loop; a spill would be correct but add overhead.
+ * Instruction sequence per (i,j) pair:
+ *   asm("vsetvli zero, %vl, e32, m4, ta, ma")  — outer: arm vl for loads
+ *   asm("vle32.v v0, (Hm[i])")                 — outer: load row i → v0-v3
+ *   asm("vsetvli zero, %vl, e32, m4, ta, ma")  — inner: re-arm vl
+ *   asm("vle32.v v4, (Hm[j])")                 — inner: load row j → v4-v7
+ *   asm("vmul.vv v8, v0, v4")                  — element-wise product
+ *   asm("vmv.s.x v20, zero")                   — scalar init: v20[0] = 0
+ *   asm("vredsum.vs v20, v8, v20")              — reduce: v20[0] = sum(v8)
+ *   asm("vmv.x.s %rd, v20")                    — extract scalar result
  *
- * Trade-offs vs style 3:
- *   + Each instruction is independently visible to the compiler — easier to
- *     add perf-counters, debug, or selectively replace one instruction.
- *   + For loops keep the source compact and easy to adapt (e.g. variable ROWS).
- *   - vsetvli must be re-issued explicitly since the compiler does not track
- *     vtype state across separate asm volatile boundaries.
+ * Clobber lists tell GCC which registers each asm statement writes, preventing
+ * any compiler-inserted code from using those registers as temporaries.
+ * Because GCC has no "vr"-typed C variables to manage, it never touches vector
+ * registers between asm volatiles, so the loaded values remain stable.
  * ========================================================================= */
 static void hht_asm_instr(const int32_t Hm[][COLS], int32_t out[ROWS][ROWS])
 {
-    /* Outer loop: load row[i] once; inner loop: load row[j] per j. */
     for (int i = 0; i < ROWS; i++) {
-        vint32m4_t vi;
-
+        /* Load row[i] into v0-v3 (LMUL=4, 16 elements). */
         __asm__ volatile("vsetvli zero, %[vl], e32, m4, ta, ma"
                          : : [vl] "r"(COLS) :);
-        __asm__ volatile("vle32.v %[vd], (%[rs1])"
-                         : [vd] "=vr"(vi)
-                         : [rs1] "r"(Hm[i])
-                         : "memory");
+        __asm__ volatile("vle32.v v0, (%[p])"
+                         : : [p] "r"(Hm[i])
+                         : "v0","v1","v2","v3","memory");
 
         for (int j = i; j < ROWS; j++) {
-            vint32m4_t vj, prod;
-            vint32m1_t acc;
-            int32_t    result;
+            int32_t result;
 
-            /* Re-establish vtype; then load row[j]. */
+            /* Load row[j] into v4-v7. */
             __asm__ volatile("vsetvli zero, %[vl], e32, m4, ta, ma"
                              : : [vl] "r"(COLS) :);
-            __asm__ volatile("vle32.v %[vd], (%[rs1])"
-                             : [vd] "=vr"(vj)
-                             : [rs1] "r"(Hm[j])
-                             : "memory");
+            __asm__ volatile("vle32.v v4, (%[p])"
+                             : : [p] "r"(Hm[j])
+                             : "v4","v5","v6","v7","memory");
 
-            /* Element-wise multiply: prod[k] = vi[k] * vj[k] */
-            __asm__ volatile("vmul.vv %[vd], %[vs2], %[vs1]"
-                             : [vd] "=vr"(prod)
-                             : [vs2] "vr"(vi), [vs1] "vr"(vj));
+            /* Element-wise multiply: v8[k] = v0[k] * v4[k]. */
+            __asm__ volatile("vmul.vv v8, v0, v4"
+                             : : : "v8","v9","v10","v11");
 
-            /* Scalar init: acc[0] = 0  (vmv.s.x ignores current LMUL) */
-            __asm__ volatile("vmv.s.x %[vd], zero"
-                             : [vd] "=vr"(acc));
+            /* Scalar accumulator init: v20[0] = 0. */
+            __asm__ volatile("vmv.s.x v20, zero"
+                             : : : "v20");
 
-            /* Horizontal sum: acc[0] = acc[0] + sum(prod[0..vl-1])
-             * "+vr" makes acc both the vs1 initializer and the vd result. */
-            __asm__ volatile("vredsum.vs %[vd], %[vs2], %[vd]"
-                             : [vd] "+vr"(acc)
-                             : [vs2] "vr"(prod));
+            /* Horizontal reduction: v20[0] += sum(v8[0..vl-1]). */
+            __asm__ volatile("vredsum.vs v20, v8, v20"
+                             : : : "v20");
 
-            /* Extract scalar result from element 0. */
-            __asm__ volatile("vmv.x.s %[rd], %[vs1]"
-                             : [rd] "=r"(result)
-                             : [vs1] "vr"(acc));
+            /* Extract scalar result from v20[0] into a C variable. */
+            __asm__ volatile("vmv.x.s %[rd], v20"
+                             : [rd] "=r"(result));
 
             out[i][j] = result;
             out[j][i] = result;
