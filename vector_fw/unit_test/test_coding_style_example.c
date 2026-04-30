@@ -1,6 +1,6 @@
-/* test_hht_kernel.c
+/* test_coding_style_example.c
  *
- * H × H^H (Hermitian product) kernel — three implementations.
+ * H × H^H (Hermitian product) kernel — four implementations.
  *
  * For real int32, H^H = H^T (conjugate transpose = transpose).
  * H is a [4][16] int32 matrix.  R = H × H^T is a [4][4] symmetric matrix.
@@ -12,14 +12,15 @@
  *   - vmul.vv  (LMUL=4, non-widening): no known RTL bug
  *   - vredsum.vs                      : confirmed correct (CH11)
  *   - vle32.v, vmv.s.x, vmv.x.s, sw  : all functional
- *   => All three implementations should produce correct RTL output.
+ *   => All four implementations should produce correct RTL output.
  *
- * Three implementations write to vdata_start[]:
- *   [impl 1 — intrinsics ]  vdata_start[0 ..15]
- *   [impl 2 — asm regs   ]  vdata_start[16..31]
- *   [impl 3 — pure asm   ]  vdata_start[32..47]
+ * Four implementations write to vdata_start[]:
+ *   [impl 1 — intrinsics          ]  vdata_start[0 ..15]
+ *   [impl 2 — asm regs            ]  vdata_start[16..31]
+ *   [impl 3 — pure asm (one block)]  vdata_start[32..47]
+ *   [impl 4 — per-insn asm + loop ]  vdata_start[48..63]
  *
- * Expected 4×4 result (row-major, same for all three implementations):
+ * Expected 4×4 result (row-major, same for all four implementations):
  *   [  8,   8,  16,   8 ]    (0x00000008, 0x00000008, 0x00000010, 0x00000008)
  *   [  8,  16,  40,   0 ]    (0x00000008, 0x00000010, 0x00000028, 0x00000000)
  *   [ 16,  40, 120,  -8 ]    (0x00000010, 0x00000028, 0x00000078, 0xfffffff8)
@@ -47,7 +48,7 @@ static const int32_t H[ROWS][COLS] = {
     { 1,-1, 1,-1,  1,-1, 1,-1,  1,-1, 1,-1,  1,-1, 1,-1 },
 };
 
-int32_t vdata_start[48];  /* impl1→[0..15], impl2→[16..31], impl3→[32..47] */
+int32_t vdata_start[64];  /* impl1→[0..15], impl2→[16..31], impl3→[32..47], impl4→[48..63] */
 
 /* -------------------------------------------------------------------------
  * QEMU output helpers (VEC_COMPARE_QEMU mode)
@@ -325,14 +326,99 @@ static void hht_asm_pure(const int32_t Hm[][COLS], int32_t *out_flat)
 
 
 /* =========================================================================
- * Test driver
+ * Implementation 4: per-instruction inline asm with C for loops
+ * =========================================================================
+ *
+ * Like style 3 every vector operation is expressed as a raw RISC-V V
+ * instruction, but here each instruction is its own asm volatile statement
+ * rather than one large monolithic asm block.  C for loops replace the
+ * hand-unrolled sequence of 10 (i,j) pairs.
+ *
+ * Register allocation for the row vectors is handled by the compiler via the
+ * "vr" constraint (same as style 2).  The inner dot-product sequence is:
+ *
+ *   asm("vsetvli  zero, %vl, e32, m4, ta, ma")  — re-arm vl/vtype per pair
+ *   asm("vle32.v  vi, (Hm[i])")                 — load row[i] (outer loop)
+ *   asm("vle32.v  vj, (Hm[j])")                 — load row[j] (inner loop)
+ *   asm("vmul.vv  prod, vi, vj")                 — element-wise product
+ *   asm("vmv.s.x  acc,  zero")                   — acc[0] = 0  (LMUL=1)
+ *   asm("vredsum.vs acc, prod, acc")              — acc[0] = 0 + sum(prod)
+ *   asm("vmv.x.s  result, acc")                  — scalar extract
+ *
+ * GCC does not allow arrays of RVV types ("array elements cannot have RVV
+ * type"), so rows cannot be stored in vint32m4_t row[ROWS].  Instead, row[i]
+ * is a single variable vi loaded once in the outer loop; row[j] is a separate
+ * variable vj reloaded for each j.  The compiler keeps vi live in a vector
+ * register across the inner loop; a spill would be correct but add overhead.
+ *
+ * Trade-offs vs style 3:
+ *   + Each instruction is independently visible to the compiler — easier to
+ *     add perf-counters, debug, or selectively replace one instruction.
+ *   + For loops keep the source compact and easy to adapt (e.g. variable ROWS).
+ *   - vsetvli must be re-issued explicitly since the compiler does not track
+ *     vtype state across separate asm volatile boundaries.
  * ========================================================================= */
+static void hht_asm_instr(const int32_t Hm[][COLS], int32_t out[ROWS][ROWS])
+{
+    /* Outer loop: load row[i] once; inner loop: load row[j] per j. */
+    for (int i = 0; i < ROWS; i++) {
+        vint32m4_t vi;
+
+        __asm__ volatile("vsetvli zero, %[vl], e32, m4, ta, ma"
+                         : : [vl] "r"(COLS) :);
+        __asm__ volatile("vle32.v %[vd], (%[rs1])"
+                         : [vd] "=vr"(vi)
+                         : [rs1] "r"(Hm[i])
+                         : "memory");
+
+        for (int j = i; j < ROWS; j++) {
+            vint32m4_t vj, prod;
+            vint32m1_t acc;
+            int32_t    result;
+
+            /* Re-establish vtype; then load row[j]. */
+            __asm__ volatile("vsetvli zero, %[vl], e32, m4, ta, ma"
+                             : : [vl] "r"(COLS) :);
+            __asm__ volatile("vle32.v %[vd], (%[rs1])"
+                             : [vd] "=vr"(vj)
+                             : [rs1] "r"(Hm[j])
+                             : "memory");
+
+            /* Element-wise multiply: prod[k] = vi[k] * vj[k] */
+            __asm__ volatile("vmul.vv %[vd], %[vs2], %[vs1]"
+                             : [vd] "=vr"(prod)
+                             : [vs2] "vr"(vi), [vs1] "vr"(vj));
+
+            /* Scalar init: acc[0] = 0  (vmv.s.x ignores current LMUL) */
+            __asm__ volatile("vmv.s.x %[vd], zero"
+                             : [vd] "=vr"(acc));
+
+            /* Horizontal sum: acc[0] = acc[0] + sum(prod[0..vl-1])
+             * "+vr" makes acc both the vs1 initializer and the vd result. */
+            __asm__ volatile("vredsum.vs %[vd], %[vs2], %[vd]"
+                             : [vd] "+vr"(acc)
+                             : [vs2] "vr"(prod));
+
+            /* Extract scalar result from element 0. */
+            __asm__ volatile("vmv.x.s %[rd], %[vs1]"
+                             : [rd] "=r"(result)
+                             : [vs1] "vr"(acc));
+
+            out[i][j] = result;
+            out[j][i] = result;
+        }
+    }
+}
+
+
+
 static void do_ops(void)
 {
     /* Each implementation writes a 4×4 = 16-element row-major result block. */
     hht_intrinsic(H, (int32_t (*)[ROWS])&vdata_start[0]);   /* [0 ..15] */
     hht_asm_reg  (H, (int32_t (*)[ROWS])&vdata_start[16]);  /* [16..31] */
     hht_asm_pure (H, &vdata_start[32]);                      /* [32..47] */
+    hht_asm_instr(H, (int32_t (*)[ROWS])&vdata_start[48]);  /* [48..63] */
 }
 
 int main(void)
